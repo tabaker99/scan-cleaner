@@ -2,7 +2,7 @@
 """Straighten, crop and locally normalize scanned PDF pages.
 
 Requires: pip install pymupdf opencv-python numpy scipy
-Example: python clean_scanned_pdf.py input.pdf output.pdf --dpi 320
+Example: python clean_scanned_pdf.py input.pdf output.pdf --dpi 320 --output-dpi 200
 All output pages are 5.5 x 8.5 inches. Pages with similar central-region
 character sizes share a document-wide crop frame to avoid artifact-induced
 zoom differences. Unusual layouts are handled conservatively.
@@ -828,6 +828,8 @@ def main():
     ap.add_argument('output', type=Path)
     ap.add_argument('--dpi', type=int, default=320,
                     help='output raster resolution in DPI (default: 320; avoids reducing common high-resolution scans)')
+    ap.add_argument('--output-dpi', type=int, default=200,
+                    help='final embedded-image DPI after processing (default: 200; set to 320 to preserve processing resolution)')
     ap.add_argument('--max-skew', type=float, default=8.0)
     ap.add_argument('--margin-mm', type=float, default=7.0)
     ap.add_argument('--tile-ems', type=float, default=4.0,
@@ -849,19 +851,22 @@ def main():
     ap.add_argument('--text-black-cutoff', type=float, default=0.6,
                     help='normalized black cutoff in text (default: 0.6)')
     ap.add_argument('--text-detector', choices=['legacy','strict','adaptive','sauvola','background','stroke-core'],
-                    default='strict',help='raw pixel detector used for text-line proposals')
+                    default='stroke-core',help='raw pixel detector used for text-line proposals')
     ap.add_argument('--text-filter', choices=['off','neighbors','baseline','combined','tuned-baseline','tuned-neighbors','height-neighbors','height-neighbors-rescue'],
                     default='height-neighbors', help='spatial pixel filter before text-line grouping')
     ap.add_argument('--no-text-contrast', dest='text_contrast', action='store_false',
                     help='disable default text-aware contrast masking')
     ap.set_defaults(text_contrast=True)
-    ap.add_argument('--text-white-cutoff', type=float, default=0.4,
-                    help='normalized white cutoff in text (default: 0.4)')
-    ap.add_argument('--white-cutoff', type=float, default=0.0,
-                    help='normalized white cutoff outside text (default: 0)')
+    ap.add_argument('--text-white-cutoff', type=float, default=0.3,
+                    help='normalized white cutoff in text (default: 0.3)')
+    ap.add_argument('--white-cutoff', type=float, default=0.2,
+                    help='normalized white cutoff outside text (default: 0.2)')
     ap.add_argument('--black-cutoff', type=float, default=1.0,
                     help='normalized black cutoff outside text (default: 1)')
     args = ap.parse_args()
+    if args.dpi < 1: ap.error('--dpi must be positive')
+    if not 1 <= args.output_dpi <= args.dpi:
+        ap.error('--output-dpi must be between 1 and --dpi (final stage only downsamples)')
     if args.text_feather_fonts < 0 or not math.isfinite(args.text_feather_fonts): ap.error('--text-feather-fonts must be nonnegative and finite')
     if not math.isfinite(args.tile_ems) or args.tile_ems <= 0: ap.error('--tile-ems must be positive and finite')
     if not 1 <= args.jpeg_quality <= 100: ap.error('--jpeg-quality must be 1..100')
@@ -1021,6 +1026,15 @@ def main():
                                         white_cutoff=white_cutoff,
                                         text_reference=text_reference)
 
+        # LAST raster operation: downsample the fully enhanced grayscale page.
+        # Contrast, mask geometry, feathering, cropping and font matching all
+        # run at --dpi (320 by default); only the final JPEG is at --output-dpi.
+        # The PDF page stays physically 5.5 x 8.5 inches.
+        if args.output_dpi != args.dpi:
+            final_width = round(5.5 * args.output_dpi)
+            final_height = round(8.5 * args.output_dpi)
+            gray_final = cv2.resize(gray_final, (final_width, final_height),
+                                    interpolation=cv2.INTER_AREA)
         encoded = encode_grayscale_jpeg(gray_final, quality=args.jpeg_quality)
         new=output.new_page(width=5.5*72,height=8.5*72)
         new.insert_image(new.rect,stream=encoded)
