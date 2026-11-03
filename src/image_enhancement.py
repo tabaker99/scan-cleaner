@@ -114,81 +114,51 @@ def histogram_peaks(gray, text_weight=None):
     return float(peak), float(white_peak)
 
 
-def enhance_grayscale(gray, strength=1.0, white_strength=1.0,
+def enhance_grayscale(gray, black_cutoff=0.6, white_cutoff=0.4,
                       text_reference=None, return_peaks=False):
-    """Apply linear clipping with separately controlled black and white limits.
+    """Linearly remap grayscale using peak-normalized cutoffs.
 
-    Parameters
-    ----------
-    gray : numpy.ndarray
-        2D uint8 grayscale image.
-    strength : nonnegative float or numpy.ndarray
-        Black-point aggression: 0 avoids black enhancement, 1 maps the ink
-        histogram peak to black, and >1 pushes the clipping boundary beyond
-        that peak. Pixel masks allow different contrast in text/background.
-    white_strength : nonnegative float or numpy.ndarray
-        White-point clipping independent of black enhancement. A scalar
-        adjusts the entire image; a pixel-aligned float map applies stronger
-        whitening around text without changing non-text regions. Default 1.
-        Values above 1 progressively lower the white cutoff.
-    text_reference : numpy.ndarray, optional
-        Pixel-aligned [0,1] text likelihood mask for estimating the black
-        peak without scanner edges.
-    return_peaks : bool
-        If true, also return diagnostic (black_peak, white_peak).
-
-    Returns
-    -------
-    numpy.ndarray or tuple
-        Grayscale image, optionally accompanied by peak positions.
-
-    Notes
-    -----
-    Purely linear clipping: no gamma, unsharp mask, or tone-curve exponent.
+    Both parameters run from 0 at the paper-white histogram peak to 1 at
+    the dark-ink histogram peak. The black cutoff position must be >= the
+    white position. Equal cutoffs give a hard threshold.
+    Scalars or image-shaped parameter maps are supported.
     """
     if gray.ndim != 2 or gray.dtype != np.uint8:
         raise ValueError('gray must be a two-dimensional uint8 image')
-    if np.isscalar(strength):
-        strength = float(strength)
-        if not np.isfinite(strength) or strength < 0:
-            raise ValueError('strength must be finite and nonnegative')
-    else:
-        strength = np.asarray(strength, dtype=np.float32)
-        if strength.shape != gray.shape or not np.all(np.isfinite(strength)) or np.any(strength<0):
-            raise ValueError('strength mask must match image and contain finite nonnegative values')
-    if np.isscalar(white_strength):
-        white_strength = float(white_strength)
-        if not np.isfinite(white_strength) or white_strength < 0:
-            raise ValueError('white_strength must be finite and nonnegative')
-    else:
-        white_strength = np.asarray(white_strength, dtype=np.float32)
-        if (white_strength.shape != gray.shape
-                or np.any(~np.isfinite(white_strength))
-                or np.any(white_strength < 0)):
-            raise ValueError('white_strength map must have image shape '
-                             'and finite nonnegative values')
-    black, white = histogram_peaks(gray, text_reference)
-    original = gray.astype(np.float32)
-    # White clipping applies everywhere, including non-text, to remove paper.
-    # Lower the input white cutoff near text, retaining the independently
-    # specified paper whitening elsewhere. This remains a linear stretch with
-    # clipping; it does not introduce gamma or spatial sharpening.
-    white_aggression = np.minimum(white_strength, 6.0)
-    white_cut = white - white_aggression * 0.035 * (255.0-white+50.0)
-    white_cut = np.maximum(white-40.0, np.minimum(255.0, white_cut))
-    # No reliable dark peak? Do not invent one or amplify dark artifacts.
-    if black is None:
-        black_cut = 0.0
-    else:
-        # At s=1 black peak maps to zero. Values >1 clip increasingly lighter
-        # inks, up to a bounded extra fraction of ink-to-paper separation.
-        extra = np.clip(strength-1.0,0.0,4.0)*0.075*(white-black)
-        black_cut = black*np.minimum(strength,1.0) + extra
-    black_cut = np.minimum(black_cut, white_cut-32.0)
-    out = np.clip((original-black_cut)*(255.0/np.maximum(white_cut-black_cut,1.0)),0,255)
-    result = np.rint(out).astype(np.uint8)
-    return (result,(black,white)) if return_peaks else result
 
+    def validate(name, value):
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim not in (0, 2) or (arr.ndim == 2 and arr.shape != gray.shape):
+            raise ValueError(f'{name} must be scalar or image-shaped')
+        if not np.all(np.isfinite(arr)) or np.any((arr < 0) | (arr > 1)):
+            raise ValueError(f'{name} must contain values in [0, 1]')
+        return arr
+
+    black_pos = validate('black_cutoff', black_cutoff)
+    white_pos = validate('white_cutoff', white_cutoff)
+    if np.any(black_pos < white_pos - 1.e-7):
+        raise ValueError('black_cutoff must be >= white_cutoff')
+
+    ink_peak, paper_peak = histogram_peaks(gray, text_reference)
+    if ink_peak is None:
+        # The parameter scale has no defensible dark endpoint without ink.
+        result = gray.copy()
+        return (result, (ink_peak, paper_peak)) if return_peaks else result
+
+    span = paper_peak - ink_peak
+    white_value = paper_peak - white_pos * span
+    black_value = paper_peak - black_pos * span
+    distance = white_value - black_value
+    original = gray.astype(np.float32)
+    # Equal cutoffs are a valid user setting: treat as binary threshold.
+    # np.maximum protects the denominator and np.where chooses that step.
+    mapped = np.where(
+        distance > 1.e-6,
+        255.0 * (original - black_value) / np.maximum(distance, 1.e-6),
+        np.where(original >= white_value, 255., 0.),
+    )
+    result = np.rint(np.clip(mapped, 0, 255)).astype(np.uint8)
+    return (result, (ink_peak, paper_peak)) if return_peaks else result
 
 def expand_text_regions(lines, max_empty_lines=1.0, method="median",
                         include_outliers=True, quantile=0.15):
@@ -302,21 +272,29 @@ def text_contrast_mask(shape, lines, background=0.3, foreground=1.0,
 
 
 def line_contrast_mask(shape, lines, background=0.0, foreground=5.0,
-                       padding=8, feather=17.0):
-    """Construct contrast mask directly from line rectangles, without grouping.
+                       padding=8, feather=17.0, expand_fraction=0.4):
+    """Construct a smooth line-based contrast mask.
+
+    Each detected line rectangle is first expanded by ``padding`` plus a
+    fraction of the feather radius, then the binary mask is Gaussian blurred.
+    This produces a mask that is full strength across text interiors while
+    falling off smoothly outside the rectangles, without an abrupt hard-box
+    transition.
 
     Parameters
     ----------
     shape : tuple
         Output image dimensions, with height and width first.
     lines : sequence of tuple
-        Each line is (x0, y0, x1, y1[, component_count]) in output pixels.
+        Each line is ``(x0, y0, x1, y1[, component_count])`` in output pixels.
     background, foreground : float
-        Black-clipping strengths outside and inside the line regions.
-    padding : int
-        Pixel margin around each detected line (before feathering).
-    feather : float
+        Contrast strengths outside and inside the line regions.
+    padding : int, optional
+        Base pixel margin around each detected line before feathering.
+    feather : float, optional
         Gaussian sigma in output pixels, derived from glyph height by caller.
+    expand_fraction : float, optional
+        Additional pre-blur rectangle expansion as a fraction of ``feather``.
 
     Returns
     -------
@@ -326,20 +304,30 @@ def line_contrast_mask(shape, lines, background=0.0, foreground=5.0,
     h, w = shape[:2]
     if (not np.isfinite(background) or not np.isfinite(foreground)
             or background < 0 or foreground < 0 or padding < 0
-            or feather < 0 or not np.isfinite(feather)):
+            or feather < 0 or not np.isfinite(feather)
+            or not np.isfinite(expand_fraction) or expand_fraction < 0):
         raise ValueError('invalid contrast-mask parameters')
-    mask = np.zeros((h,w), np.uint8)
-    pad = int(round(padding))
-    for x0,y0,x1,y1,*_ in lines:
-        xa=max(0,int(np.floor(x0))-pad)
-        ya=max(0,int(np.floor(y0))-pad)
-        xb=min(w,int(np.ceil(x1))+pad)
-        yb=min(h,int(np.ceil(y1))+pad)
-        if xb>xa and yb>ya:
-            mask[ya:yb,xa:xb] = 255
+    mask = np.zeros((h, w), np.uint8)
+    pad = int(round(padding + expand_fraction * feather))
+    for x0, y0, x1, y1, *_ in lines:
+        xa = max(0, int(np.floor(x0)) - pad)
+        ya = max(0, int(np.floor(y0)) - pad)
+        xb = min(w, int(np.ceil(x1)) + pad)
+        yb = min(h, int(np.ceil(y1)) + pad)
+        if xb > xa and yb > ya:
+            mask[ya:yb, xa:xb] = 255
     if feather > 0:
-        mask = cv2.GaussianBlur(mask,(0,0),sigmaX=float(feather),sigmaY=float(feather))
-    return (background + (foreground-background)*(mask.astype(np.float32)/255)).astype(np.float32)
+        sigma = float(feather)
+        k = max(3, int(round(sigma * 6)) | 1)
+        blurred = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (k, k),
+                                   sigmaX=sigma, sigmaY=sigma,
+                                   borderType=cv2.BORDER_REPLICATE)
+        maxv = float(blurred.max())
+        weights = np.clip(blurred / maxv, 0.0, 1.0) if maxv > 1e-6 else blurred
+    else:
+        weights = mask.astype(np.float32) / 255.0
+    return (background + (foreground - background) * weights).astype(np.float32)
+
 
 
 def encode_grayscale_jpeg(gray, quality=72):

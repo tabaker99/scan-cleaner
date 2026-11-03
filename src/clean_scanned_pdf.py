@@ -844,10 +844,10 @@ def main():
                     help='trace slanted edge/spine shadows, whiten toward page edges while protecting text')
     ap.add_argument('--jpeg-quality', type=int, default=72,
                     help='grayscale JPEG quality 1-100 (default: 72; smaller PDF than PNG)')
-    ap.add_argument('--text-feather-fonts', type=float, default=0.8,
-                    help='Gaussian feather sigma in units of average output glyph height (default: 0.8)')
-    ap.add_argument('--contrast-strength', type=float, default=5.0,
-                    help='text black-clipping multiplier (default: 5; 1 = ink peak goes to black)')
+    ap.add_argument('--text-feather-fonts', type=float, default=0.4,
+                    help='Gaussian feather sigma in units of average output glyph height (default: 0.4)')
+    ap.add_argument('--text-black-cutoff', type=float, default=0.6,
+                    help='normalized black cutoff in text (default: 0.6)')
     ap.add_argument('--text-detector', choices=['legacy','strict','adaptive','sauvola','background','stroke-core'],
                     default='strict',help='raw pixel detector used for text-line proposals')
     ap.add_argument('--text-filter', choices=['off','neighbors','baseline','combined','tuned-baseline','tuned-neighbors','height-neighbors','height-neighbors-rescue'],
@@ -855,20 +855,24 @@ def main():
     ap.add_argument('--no-text-contrast', dest='text_contrast', action='store_false',
                     help='disable default text-aware contrast masking')
     ap.set_defaults(text_contrast=True)
-    ap.add_argument('--text-white-strength', type=float, default=3.5,
-                    help='paper whitening strength inside detected text lines (default: 3.5; non-text uses --white-strength)')
-    ap.add_argument('--white-strength', type=float, default=1.0,
-                    help='global paper-white clipping strength, independent of ink contrast (default: 1)')
-    ap.add_argument('--background-contrast', type=float, default=0.0,
-                    help='black clipping multiplier outside text (default: 0)')
+    ap.add_argument('--text-white-cutoff', type=float, default=0.4,
+                    help='normalized white cutoff in text (default: 0.4)')
+    ap.add_argument('--white-cutoff', type=float, default=0.0,
+                    help='normalized white cutoff outside text (default: 0)')
+    ap.add_argument('--black-cutoff', type=float, default=1.0,
+                    help='normalized black cutoff outside text (default: 1)')
     args = ap.parse_args()
     if args.text_feather_fonts < 0 or not math.isfinite(args.text_feather_fonts): ap.error('--text-feather-fonts must be nonnegative and finite')
     if not math.isfinite(args.tile_ems) or args.tile_ems <= 0: ap.error('--tile-ems must be positive and finite')
     if not 1 <= args.jpeg_quality <= 100: ap.error('--jpeg-quality must be 1..100')
-    if not math.isfinite(args.white_strength) or args.white_strength < 0: ap.error('--white-strength must be >= 0')
-    if not math.isfinite(args.text_white_strength) or args.text_white_strength < 0: ap.error('--text-white-strength must be >= 0')
-    if not math.isfinite(args.contrast_strength) or args.contrast_strength < 0: ap.error('--contrast-strength must be finite and >= 0')
-    if not math.isfinite(args.background_contrast) or args.background_contrast < 0: ap.error('--background-contrast must be finite and >= 0')
+    for name in ('white_cutoff', 'black_cutoff', 'text_white_cutoff', 'text_black_cutoff'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            ap.error('--' + name.replace('_', '-') + ' must be in [0,1]')
+    if args.black_cutoff < args.white_cutoff:
+        ap.error('--black-cutoff must be >= --white-cutoff')
+    if args.text_black_cutoff < args.text_white_cutoff:
+        ap.error('--text-black-cutoff must be >= --text-white-cutoff')
     if args.input.resolve() == args.output.resolve():
         ap.error('Input and output must differ')
     source = fitz.open(args.input)
@@ -1004,21 +1008,17 @@ def main():
             text_reference = line_contrast_mask(gray_final.shape, final_lines,
                                                 background=0.0, foreground=1.0,
                                                 feather=feather_pixels)
-            strength = line_contrast_mask(gray_final.shape, final_lines,
-                                          background=args.background_contrast,
-                                          foreground=args.contrast_strength,
-                                          feather=feather_pixels)
-            # Reuse the exact same feathered line coverage for both independent
-            # clipping cutoffs. Keep black clipping unchanged while lowering
-            # the white cutoff inside text regions only.
-            white_strength = (args.white_strength +
-                              (args.text_white_strength - args.white_strength)
-                              * text_reference)
+            # Outward-only feathering controls two peak-normalized cutoff
+            # positions, with full contrast everywhere inside line rectangles.
+            white_cutoff = (args.white_cutoff +
+                            (args.text_white_cutoff - args.white_cutoff) * text_reference)
+            black_cutoff = (args.black_cutoff +
+                            (args.text_black_cutoff - args.black_cutoff) * text_reference)
         else:
-            strength = args.contrast_strength
-            white_strength = args.white_strength
-        gray_final = enhance_grayscale(gray_final, strength=strength,
-                                        white_strength=white_strength,
+            white_cutoff = args.white_cutoff
+            black_cutoff = args.black_cutoff
+        gray_final = enhance_grayscale(gray_final, black_cutoff=black_cutoff,
+                                        white_cutoff=white_cutoff,
                                         text_reference=text_reference)
 
         encoded = encode_grayscale_jpeg(gray_final, quality=args.jpeg_quality)
