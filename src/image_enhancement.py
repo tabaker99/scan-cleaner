@@ -126,9 +126,11 @@ def enhance_grayscale(gray, strength=1.0, white_strength=1.0,
         Black-point aggression: 0 avoids black enhancement, 1 maps the ink
         histogram peak to black, and >1 pushes the clipping boundary beyond
         that peak. Pixel masks allow different contrast in text/background.
-    white_strength : nonnegative float
-        White-point clipping independent of black enhancement. Default 1
-        moves the paper peak slightly inside the white clipping threshold.
+    white_strength : nonnegative float or numpy.ndarray
+        White-point clipping independent of black enhancement. A scalar
+        adjusts the entire image; a pixel-aligned float map applies stronger
+        whitening around text without changing non-text regions. Default 1.
+        Values above 1 progressively lower the white cutoff.
     text_reference : numpy.ndarray, optional
         Pixel-aligned [0,1] text likelihood mask for estimating the black
         peak without scanner edges.
@@ -154,13 +156,26 @@ def enhance_grayscale(gray, strength=1.0, white_strength=1.0,
         strength = np.asarray(strength, dtype=np.float32)
         if strength.shape != gray.shape or not np.all(np.isfinite(strength)) or np.any(strength<0):
             raise ValueError('strength mask must match image and contain finite nonnegative values')
-    if not np.isfinite(white_strength) or white_strength < 0:
-        raise ValueError('white_strength must be finite and nonnegative')
+    if np.isscalar(white_strength):
+        white_strength = float(white_strength)
+        if not np.isfinite(white_strength) or white_strength < 0:
+            raise ValueError('white_strength must be finite and nonnegative')
+    else:
+        white_strength = np.asarray(white_strength, dtype=np.float32)
+        if (white_strength.shape != gray.shape
+                or np.any(~np.isfinite(white_strength))
+                or np.any(white_strength < 0)):
+            raise ValueError('white_strength map must have image shape '
+                             'and finite nonnegative values')
     black, white = histogram_peaks(gray, text_reference)
     original = gray.astype(np.float32)
     # White clipping applies everywhere, including non-text, to remove paper.
-    white_cut = white - min(float(white_strength), 3.0) * 0.035 * (255.0-white+50.0)
-    white_cut = max(white-25.0, min(255.0,white_cut))
+    # Lower the input white cutoff near text, retaining the independently
+    # specified paper whitening elsewhere. This remains a linear stretch with
+    # clipping; it does not introduce gamma or spatial sharpening.
+    white_aggression = np.minimum(white_strength, 6.0)
+    white_cut = white - white_aggression * 0.035 * (255.0-white+50.0)
+    white_cut = np.maximum(white-40.0, np.minimum(255.0, white_cut))
     # No reliable dark peak? Do not invent one or amplify dark artifacts.
     if black is None:
         black_cut = 0.0
@@ -284,6 +299,47 @@ def text_contrast_mask(shape, lines, background=0.3, foreground=1.0,
     if feather:
         mask=cv2.GaussianBlur(mask,(0,0),sigmaX=feather,sigmaY=feather)
     return (background+(foreground-background)*mask.astype(np.float32)/255).astype(np.float32)
+
+
+def line_contrast_mask(shape, lines, background=0.0, foreground=5.0,
+                       padding=8, feather=17.0):
+    """Construct contrast mask directly from line rectangles, without grouping.
+
+    Parameters
+    ----------
+    shape : tuple
+        Output image dimensions, with height and width first.
+    lines : sequence of tuple
+        Each line is (x0, y0, x1, y1[, component_count]) in output pixels.
+    background, foreground : float
+        Black-clipping strengths outside and inside the line regions.
+    padding : int
+        Pixel margin around each detected line (before feathering).
+    feather : float
+        Gaussian sigma in output pixels, derived from glyph height by caller.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 spatial clipping-strength mask.
+    """
+    h, w = shape[:2]
+    if (not np.isfinite(background) or not np.isfinite(foreground)
+            or background < 0 or foreground < 0 or padding < 0
+            or feather < 0 or not np.isfinite(feather)):
+        raise ValueError('invalid contrast-mask parameters')
+    mask = np.zeros((h,w), np.uint8)
+    pad = int(round(padding))
+    for x0,y0,x1,y1,*_ in lines:
+        xa=max(0,int(np.floor(x0))-pad)
+        ya=max(0,int(np.floor(y0))-pad)
+        xb=min(w,int(np.ceil(x1))+pad)
+        yb=min(h,int(np.ceil(y1))+pad)
+        if xb>xa and yb>ya:
+            mask[ya:yb,xa:xb] = 255
+    if feather > 0:
+        mask = cv2.GaussianBlur(mask,(0,0),sigmaX=float(feather),sigmaY=float(feather))
+    return (background + (foreground-background)*(mask.astype(np.float32)/255)).astype(np.float32)
 
 
 def encode_grayscale_jpeg(gray, quality=72):

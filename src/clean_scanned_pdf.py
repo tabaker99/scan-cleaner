@@ -24,7 +24,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.ndimage import median_filter
 from image_enhancement import (normalize_local, enhance_grayscale,
-                               text_contrast_mask, encode_grayscale_jpeg, grid_cell_pixels)
+                               text_contrast_mask, line_contrast_mask, encode_grayscale_jpeg, grid_cell_pixels)
 
 
 def foreground(gray):
@@ -172,7 +172,7 @@ def rotate_bound(image, angle, bg=255):
                           borderMode=cv2.BORDER_CONSTANT, borderValue=(bg, bg, bg))
 
 
-def text_bbox(img, margin=24, return_lines=False, detector="legacy", spatial_filter="height-neighbors"):
+def text_bbox(img, margin=24, return_lines=False, detector="legacy", spatial_filter="height-neighbors", return_accepted=False):
     """Find a conservative text-derived crop rectangle without OCR.
 
     Parameters
@@ -259,6 +259,8 @@ def text_bbox(img, margin=24, return_lines=False, detector="legacy", spatial_fil
             and (c[3]-c[1]) > 1.15*typical_height)]
     if not candidates:
         rect = (0, 0, w, h)
+        if return_accepted:
+            return rect, [], fg, scale
         return (rect, []) if return_lines else rect
 
     # Choose the main text column using horizontal overlap consensus. This
@@ -309,6 +311,8 @@ def text_bbox(img, margin=24, return_lines=False, detector="legacy", spatial_fil
     else:
         rect = (max(0, int(x0/scale-margin)), max(0, int(y0/scale-margin)),
                 min(w, int(x1/scale+margin)), min(h, int(y1/scale+margin)))
+    if return_accepted:
+        return rect, lines, fg, scale
     return (rect, lines) if return_lines else rect
 
 
@@ -740,7 +744,7 @@ def document_crop(img, bbox, lines, frame, scale, pad=10):
     return img[y:y+fh,x:x+fw],(x,y,x+fw,y+fh),coverage,fallback
 
 
-def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="strict", text_filter="height-neighbors"):
+def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="stroke-core", text_filter="height-neighbors"):
     """Analyze one rasterized PDF page for later global crop decisions.
 
     Parameters
@@ -775,7 +779,7 @@ def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="stric
     corrected = remove_copier_bands(rotate_bound(rgb, angle))
     margin_px = round(margin_mm / 25.4 * dpi)
     if crop:
-        bbox,lines=text_bbox(corrected,margin_px,return_lines=True,detector=text_detector, spatial_filter=text_filter)
+        bbox,lines,approved_ink,shrink=text_bbox(corrected,margin_px,return_lines=True,detector=text_detector, spatial_filter=text_filter, return_accepted=True)
     else:
         h,w=corrected.shape[:2];bbox=(0,0,w,h);lines=[]
     # Measure only the center of the *original deskewed page* so that a bad
@@ -785,8 +789,19 @@ def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="stric
         # Chapter numerals (e.g. a large "1") are part of a heading;
         # small isolated folio numbers are intentionally NOT recovered.
         lines=lines+chapter_heading_component(corrected,lines,measure)
+    # Independently identify *contrast* lines from all neighbor-approved ink.
+    # The established crop detector above retains its conservative safeguards.
+    # Unlike the legacy line stage, this does not re-filter accepted characters.
+    contrast_lines = []
+    if crop:
+        from text_line_grouping import build_grouped_lines
+        _, grouped, _=build_grouped_lines(approved_ink,max_gap_ems=3.0)
+        # All multi-component line groups contribute; single isolated specks
+        # are deliberately excluded from the stronger contrast region.
+        contrast_lines=[(int(a/shrink),int(b/shrink),int(c/shrink),int(d/shrink),n)
+                        for a,b,c,d,n in grouped if n>=2]
     return dict(image=corrected,angle=angle,confidence=confidence,glyph=measure,
-                bbox=bbox,lines=lines,margin=margin_px)
+                bbox=bbox,lines=lines,contrast_lines=contrast_lines,margin=margin_px)
 
 
 
@@ -833,18 +848,15 @@ def main():
                     help='Gaussian feather sigma in units of average output glyph height (default: 0.8)')
     ap.add_argument('--contrast-strength', type=float, default=5.0,
                     help='text black-clipping multiplier (default: 5; 1 = ink peak goes to black)')
-    ap.add_argument('--max-empty-lines', type=float, default=1.0,
-                    help='maximum empty text lines bridged by one contrast rectangle (default: 1; inf for one box)')
-    ap.add_argument('--text-detector', choices=['legacy','strict','adaptive','sauvola','background'],
+    ap.add_argument('--text-detector', choices=['legacy','strict','adaptive','sauvola','background','stroke-core'],
                     default='strict',help='raw pixel detector used for text-line proposals')
     ap.add_argument('--text-filter', choices=['off','neighbors','baseline','combined','tuned-baseline','tuned-neighbors','height-neighbors','height-neighbors-rescue'],
                     default='height-neighbors', help='spatial pixel filter before text-line grouping')
-    ap.add_argument('--text-mask-method', choices=['median','mean','maximum','quantile'], default='median',
-                    help='horizontal block width statistic for text contrast mask')
-    ap.add_argument('--no-text-mask-outliers', action='store_true',
-                    help='omit original line rectangles outside the grouped block')
-    ap.add_argument('--text-contrast', action='store_true',
-                    help='use stronger contrast near detected text lines')
+    ap.add_argument('--no-text-contrast', dest='text_contrast', action='store_false',
+                    help='disable default text-aware contrast masking')
+    ap.set_defaults(text_contrast=True)
+    ap.add_argument('--text-white-strength', type=float, default=3.5,
+                    help='paper whitening strength inside detected text lines (default: 3.5; non-text uses --white-strength)')
     ap.add_argument('--white-strength', type=float, default=1.0,
                     help='global paper-white clipping strength, independent of ink contrast (default: 1)')
     ap.add_argument('--background-contrast', type=float, default=0.0,
@@ -854,6 +866,7 @@ def main():
     if not math.isfinite(args.tile_ems) or args.tile_ems <= 0: ap.error('--tile-ems must be positive and finite')
     if not 1 <= args.jpeg_quality <= 100: ap.error('--jpeg-quality must be 1..100')
     if not math.isfinite(args.white_strength) or args.white_strength < 0: ap.error('--white-strength must be >= 0')
+    if not math.isfinite(args.text_white_strength) or args.text_white_strength < 0: ap.error('--text-white-strength must be >= 0')
     if not math.isfinite(args.contrast_strength) or args.contrast_strength < 0: ap.error('--contrast-strength must be finite and >= 0')
     if not math.isfinite(args.background_contrast) or args.background_contrast < 0: ap.error('--background-contrast must be finite and >= 0')
     if args.input.resolve() == args.output.resolve():
@@ -968,7 +981,7 @@ def main():
         # and final fit-down into finished-page pixel coordinates. Geometry
         # and crop decisions remain unchanged.
         text_reference = None
-        if args.text_contrast and row['lines']:
+        if args.text_contrast and row['contrast_lines']:
             h0, w0 = result.shape[:2]
             scaled_h, scaled_w = scaled.shape[:2]
             actual_x = scaled_w / w0 * fit
@@ -982,29 +995,30 @@ def main():
                             (b-y0)*actual_y+offset_y,
                             (c-x0)*actual_x+offset_x,
                             (d-y0)*actual_y+offset_y)
-                           for a,b,c,d,*_ in row['lines']]
+                           for a,b,c,d,*_ in row['contrast_lines']]
             # Glyph measurements were made in deskewed source pixels. Convert
             # them to final output pixels before specifying feather distance.
             glyph_output = ((measure if measure is not None else (target or 24.0))
                             * actual_y)
             feather_pixels = args.text_feather_fonts * glyph_output
-            text_reference = text_contrast_mask(gray_final.shape, final_lines,
+            text_reference = line_contrast_mask(gray_final.shape, final_lines,
                                                 background=0.0, foreground=1.0,
-                                                feather=feather_pixels,
-                                                max_empty_lines=args.max_empty_lines,
-                                                method=args.text_mask_method,
-                                                include_outliers=not args.no_text_mask_outliers)
-            strength = text_contrast_mask(gray_final.shape, final_lines,
+                                                feather=feather_pixels)
+            strength = line_contrast_mask(gray_final.shape, final_lines,
                                           background=args.background_contrast,
                                           foreground=args.contrast_strength,
-                                          feather=feather_pixels,
-                                          max_empty_lines=args.max_empty_lines,
-                                          method=args.text_mask_method,
-                                          include_outliers=not args.no_text_mask_outliers)
+                                          feather=feather_pixels)
+            # Reuse the exact same feathered line coverage for both independent
+            # clipping cutoffs. Keep black clipping unchanged while lowering
+            # the white cutoff inside text regions only.
+            white_strength = (args.white_strength +
+                              (args.text_white_strength - args.white_strength)
+                              * text_reference)
         else:
             strength = args.contrast_strength
+            white_strength = args.white_strength
         gray_final = enhance_grayscale(gray_final, strength=strength,
-                                        white_strength=args.white_strength,
+                                        white_strength=white_strength,
                                         text_reference=text_reference)
 
         encoded = encode_grayscale_jpeg(gray_final, quality=args.jpeg_quality)

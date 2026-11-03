@@ -165,7 +165,7 @@ def tuned_horizontal_neighbors(gray,binary,min_neighbors=1,
 def height_based_horizontal_neighbors(gray, binary, min_neighbors=2,
                                       max_gap_heights=2.0,
                                       vertical_tolerance=0.65,
-                                      height_ratio=2.5):
+                                      height_ratio=2.5, split_wide=True):
     """Retain horizontally supported groups of character-like ink components.
 
     Examine larger candidate components first. A seed qualifies when it has
@@ -197,6 +197,10 @@ def height_based_horizontal_neighbors(gray, binary, min_neighbors=2,
 
     Notes
     -----
+    When ``split_wide`` is true, wide components are logically split at
+    vertical ink-density valleys *before* the neighbor test. All source ink
+    pixels remain intact; erosion is not used.
+
     Acceptance is monotone: previously accepted components are never removed.
     Accepted components are skipped as qualification seeds. Each accepted
     component is expanded at most once to discover the rest of its group;
@@ -206,7 +210,12 @@ def height_based_horizontal_neighbors(gray, binary, min_neighbors=2,
     from collections import deque
 
     binary = (binary > 0).astype(np.uint8)
-    n, labels, stats, centers = cv2.connectedComponentsWithStats(binary, 8)
+    if split_wide:
+        from component_splitting import split_wide_components
+        labels, stats, centers, _ = split_wide_components(binary)
+        n = len(stats)
+    else:
+        n, labels, stats, centers = cv2.connectedComponentsWithStats(binary, 8)
     h, w = binary.shape
     chosen = []
     for k in range(1, n):
