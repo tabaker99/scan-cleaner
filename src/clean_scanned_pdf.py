@@ -1183,6 +1183,8 @@ def main():
     ap.add_argument('--pages', default=None, help='page range, e.g. 1-3 or 2,4,6')
     ap.add_argument('--gutter-geometry', type=Path, default=None,
                     help='splitter JSON sidecar (autodetected beside input by default)')
+    ap.add_argument('--require-gutter-geometry', action='store_true',
+                    help='fail rather than silently skip deferred gutter removal when the sidecar is missing')
     ap.add_argument('--no-crop', action='store_true', help='keep whole page after straightening')
     ap.add_argument('--font-tolerance', type=float, default=.08,
                     help='normalize text-rich pages whose estimated glyph size differs at most this fraction from the document reference (default: 0.15)')
@@ -1237,8 +1239,10 @@ def main():
             raise ValueError(f'Gutter geometry does not match input PDF: {gutter_sidecar}')
         gutter_records={int(p['page']):p for p in payload['pages']}
         print(f'Loaded deferred gutter geometry: {gutter_sidecar}',file=sys.stderr)
-    elif args.gutter_geometry is not None:
-        raise FileNotFoundError(args.gutter_geometry)
+    elif args.gutter_geometry is not None or args.require_gutter_geometry:
+        raise FileNotFoundError(f'Deferred gutter geometry missing: {gutter_sidecar}')
+    else:
+        print(f'WARNING: no deferred gutter geometry at {gutter_sidecar}; gutter removal disabled',file=sys.stderr)
     output = fitz.open()
     if args.pages:
         indices = []
@@ -1382,7 +1386,7 @@ def main():
                           for a,b,c,d,count in row['lines']
                           if c > x0 and a < x1 and d > y0 and b < y1]
             result = remove_vertical_edge_artifacts(result, text_lines=crop_lines)
-        if args.remove_slanted_edge_artifacts and mode != 'sparse-full-page':
+        if args.remove_slanted_edge_artifacts:
             # Optional independent stage: the legacy filter above remains
             # untouched. Prefer this tracer for tapered / slanted shadows.
             from remove_slanted_edge_artifacts import remove_slanted_edge_artifacts
