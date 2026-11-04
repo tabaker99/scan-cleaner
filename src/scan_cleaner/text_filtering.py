@@ -211,7 +211,7 @@ def height_based_horizontal_neighbors(gray, binary, min_neighbors=2,
 
     binary = (binary > 0).astype(np.uint8)
     if split_wide:
-        from component_splitting import split_wide_components
+        from .component_splitting import split_wide_components
         labels, stats, centers, _ = split_wide_components(binary)
         n = len(stats)
     else:

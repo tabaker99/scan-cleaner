@@ -6,7 +6,7 @@ trusted text-line bounds. Text, diagrams, and unknown marks inside the protected
 content area are never altered.
 
 This is a standalone module: it has no dependency on the main PDF cleaner and
-may be imported with ``from remove_vertical_scan_artifacts import ...``.
+may be imported with ``from .remove_vertical_scan_artifacts import ...``.
 """
 
 from __future__ import annotations

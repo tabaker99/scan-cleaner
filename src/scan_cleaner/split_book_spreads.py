@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from deferred_gutter import trace_gutter_shadow
+from .deferred_gutter import trace_gutter_shadow
 from pathlib import Path
 
 import fitz

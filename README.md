@@ -1,32 +1,37 @@
-# Scanned PDF processing
+# Scan Cleaner
 
-All production code is in `src/`. `scripts/` is reserved for optional, experimental development and is **not required** for processing.
+Clean scanned two-page book spreads into **5.5 × 8.5-inch** pages. Default processing is at 320 DPI, with final output downsampled to 200 DPI.
 
 ## Install
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install .
+# editable development install:
+python -m pip install -e .
 ```
 
 ## Run
 
-Scanned, landscape book spreads already upright:
-
 ```bash
-python src/process_pdf.py input.pdf output.pdf --turns 0
+scan-cleaner input.pdf output.pdf --turns 0
+# or
+python -m scan_cleaner input.pdf output.pdf --turns 0
 ```
 
-For scans that need a quarter-turn, use `--turns 1` or `--turns -1`.
+Use `--turns -1` or `--turns 1` when scans need rotation. The program keeps intermediates and the required `split_with_gutter.gutter.json` in `<output_stem>_work/` by default. `--workdir` overrides that location.
 
-Default processing is 320 DPI with final 200 DPI half-letter pages. The workflow creates intermediate PDFs and a `.gutter.json` sidecar in `<output_stem>_work/`, then **requires** that geometry when cleaning. The sidecar is not optional in the full workflow, even if some spreads have no detectable gutter shadow.
+## Layout
 
-Optional: `--workdir /path/to/work`, `--processing-dpi 320`, `--output-dpi 200`.
+- `src/scan_cleaner/`: installed production library, pipeline and CLI.
+- `experiments/`: experimental investigations; never required for production.
+- `tests/`: automated tests.
+- No `scripts/` folder: all previous experimental scripts live in `experiments/`.
 
-### Individual production stages
+The main pipeline is importable:
 
-- `src/rotate_pdf.py`: lossless orientation adjustment
-- `src/split_book_spreads.py`: split spreads and save deferred gutter coordinates
-- `src/clean_scanned_pdf.py`: deskew, text detection, scale/alignment, masking, contrast enhancement, downsampling, half-letter PDF
-- `src/deferred_gutter.py`: text-protected deferred shadow cleanup
+```python
+from scan_cleaner import process_pdf
+process_pdf('input.pdf', 'output.pdf', turns=0)
+```
 
-Individual modules may be run directly, but `src/process_pdf.py` is preferred because it preserves gutter geometry between stages. The pipeline always splits spreads; it is not a single-page PDF mode.
+The legacy module command-line tools remain available as `python -m scan_cleaner.rotate_pdf`, `python -m scan_cleaner.split_book_spreads`, and `python -m scan_cleaner.clean_scanned_pdf`.

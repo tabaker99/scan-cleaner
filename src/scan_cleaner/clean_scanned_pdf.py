@@ -12,7 +12,7 @@ Pure image processing: no OCR, no cloud service. Output is an image-only PDF.
 # Standard-library modules: CLI parsing, PDF/image geometry, diagnostics, and paths.
 import argparse
 import json
-from deferred_gutter import apply_deferred_gutter
+from .deferred_gutter import apply_deferred_gutter
 import math
 import sys
 from pathlib import Path
@@ -25,7 +25,7 @@ import fitz
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.ndimage import median_filter
-from image_enhancement import (normalize_local, enhance_grayscale,
+from .image_enhancement import (normalize_local, enhance_grayscale,
                                text_contrast_mask, line_contrast_mask, encode_grayscale_jpeg, grid_cell_pixels)
 
 
@@ -208,12 +208,12 @@ def text_bbox(img, margin=24, return_lines=False, detector="legacy", spatial_fil
     scale = min(1., 1100 / max(h, w))
     W, H = max(1, round(w * scale)), max(1, round(h * scale))
     g = cv2.resize(gray, (W, H), interpolation=cv2.INTER_AREA)
-    from text_detection import detect_ink
+    from .text_detection import detect_ink
     fg = detect_ink(g, method=detector)
     # Optional experimentally validated ink-pixel filtering. Cropping defaults
     # to 'off' to avoid changing geometry before multi-page regression checks.
     if spatial_filter != 'off':
-        from text_filtering import neighbor_consistency, baseline_projection, union_filter, tuned_baseline, tuned_horizontal_neighbors, height_based_horizontal_neighbors, height_neighbors_with_wide_glyph_rescue
+        from .text_filtering import neighbor_consistency, baseline_projection, union_filter, tuned_baseline, tuned_horizontal_neighbors, height_based_horizontal_neighbors, height_neighbors_with_wide_glyph_rescue
         functions = {'neighbors': neighbor_consistency,
                      'baseline': baseline_projection, 'combined': union_filter,
                      'tuned-baseline': tuned_baseline, 'tuned-neighbors': tuned_horizontal_neighbors, 'height-neighbors': height_based_horizontal_neighbors, 'height-neighbors-rescue': height_neighbors_with_wide_glyph_rescue}
@@ -1136,7 +1136,7 @@ def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="strok
     # Unlike the legacy line stage, this does not re-filter accepted characters.
     contrast_lines = []
     if crop:
-        from text_line_grouping import build_grouped_lines
+        from .text_line_grouping import build_grouped_lines
         _, grouped, _=build_grouped_lines(approved_ink,max_gap_ems=3.0)
         # All multi-component line groups contribute; single isolated specks
         # are deliberately excluded from the stronger contrast region.
@@ -1380,7 +1380,7 @@ def main():
         if args.remove_vertical_artifacts and mode != 'sparse-full-page':
             # Kept in an independent module so the established crop/contrast
             # algorithm remains unchanged and this option can be disabled.
-            from remove_vertical_scan_artifacts import remove_vertical_edge_artifacts
+            from .remove_vertical_scan_artifacts import remove_vertical_edge_artifacts
             crop_lines = [(max(0, a-x0), max(0, b-y0),
                            min(x1-x0, c-x0), min(y1-y0, d-y0), count)
                           for a,b,c,d,count in row['lines']
@@ -1389,7 +1389,7 @@ def main():
         if args.remove_slanted_edge_artifacts:
             # Optional independent stage: the legacy filter above remains
             # untouched. Prefer this tracer for tapered / slanted shadows.
-            from remove_slanted_edge_artifacts import remove_slanted_edge_artifacts
+            from .remove_slanted_edge_artifacts import remove_slanted_edge_artifacts
             if not args.remove_vertical_artifacts:
                 crop_lines = [(max(0, a-x0), max(0, b-y0),
                                min(x1-x0, c-x0), min(y1-y0, d-y0), count)
