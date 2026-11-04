@@ -1,24 +1,32 @@
-# PDF processing scripts — baseline before line-grouping experiment
+# Scanned PDF processing
 
-This is the last production script set, based on the optimized group-neighbor filter.
-No new 3-em line extension or group merging has been implemented in this baseline.
+All production code is in `src/`. `scripts/` is reserved for optional, experimental development and is **not required** for processing.
 
-## Main scripts
+## Install
 
-1. rotate_pdf.py — rotate PDF pages using metadata.
-2. split_book_spreads.py — split book spreads into individual pages.
-3. clean_scanned_pdf.py — detect/deskew/crop pages and assemble the cleaned PDF.
+```bash
+python -m pip install -r requirements.txt
+```
 
-## Imported support modules
+## Run
 
-- image_enhancement.py — grayscale local correction, histogram contrast, text masks and JPEG encoding.
-- text_detection.py — candidate ink detection.
-- text_filtering.py — optimized group-based height-neighbor filtering.
-- remove_vertical_scan_artifacts.py — optional vertical edge cleanup.
-- remove_slanted_edge_artifacts.py — optional slanted edge cleanup.
+Scanned, landscape book spreads already upright:
 
-## Dependencies
+```bash
+python src/process_pdf.py input.pdf output.pdf --turns 0
+```
 
-pip install pymupdf opencv-python numpy scipy
+For scans that need a quarter-turn, use `--turns 1` or `--turns -1`.
 
-Keep all eight .py files together. The source PDFs are not included; the originals remain in /mnt/data.
+Default processing is 320 DPI with final 200 DPI half-letter pages. The workflow creates intermediate PDFs and a `.gutter.json` sidecar in `<output_stem>_work/`, then **requires** that geometry when cleaning. The sidecar is not optional in the full workflow, even if some spreads have no detectable gutter shadow.
+
+Optional: `--workdir /path/to/work`, `--processing-dpi 320`, `--output-dpi 200`.
+
+### Individual production stages
+
+- `src/rotate_pdf.py`: lossless orientation adjustment
+- `src/split_book_spreads.py`: split spreads and save deferred gutter coordinates
+- `src/clean_scanned_pdf.py`: deskew, text detection, scale/alignment, masking, contrast enhancement, downsampling, half-letter PDF
+- `src/deferred_gutter.py`: text-protected deferred shadow cleanup
+
+Individual modules may be run directly, but `src/process_pdf.py` is preferred because it preserves gutter geometry between stages. The pipeline always splits spreads; it is not a single-page PDF mode.
