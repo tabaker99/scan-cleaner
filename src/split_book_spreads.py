@@ -32,6 +32,8 @@ Show estimates without producing an output file::
 from __future__ import annotations
 
 import argparse
+import json
+from deferred_gutter import trace_gutter_shadow
 from pathlib import Path
 
 import fitz
@@ -209,7 +211,8 @@ def render_preview(page: fitz.Page, target_width: int = 1200) -> np.ndarray:
 def split_pdf(input_path: Path, output_path: Path, *, search_fraction: float = 0.19,
               gutter_mm: float = 0.0, target_width: int = 1200,
               dry_run: bool = False, min_confidence: float = 0.7,
-              min_continuity: float = 0.45) -> None:
+              min_continuity: float = 0.45,
+              save_gutter_geometry: bool = True) -> None:
     """Detect spines and export two single-page PDF pages per input spread.
 
     Parameters
@@ -246,6 +249,7 @@ def split_pdf(input_path: Path, output_path: Path, *, search_fraction: float = 0
         raise ValueError("--gutter-mm must be nonnegative")
     source = fitz.open(input_path)
     output = fitz.open()
+    geometry_pages = []
     for number, page in enumerate(source, 1):
         if page.rect.width <= page.rect.height:
             raise ValueError(
@@ -254,6 +258,7 @@ def split_pdf(input_path: Path, output_path: Path, *, search_fraction: float = 0
             )
         preview = render_preview(page, target_width)
         column, confidence = locate_spine(preview, search_fraction, min_continuity)
+        gutter_present = confidence >= min_confidence
         if confidence < min_confidence:
             white_corridor = locate_white_corridor(preview, search_fraction)
             if white_corridor is not None:
@@ -265,6 +270,12 @@ def split_pdf(input_path: Path, output_path: Path, *, search_fraction: float = 0
                 print(f"  No reliable dark gutter or white corridor on spread {number}; "
                       f"using geometric center")
                 column = preview.shape[1] // 2
+        # Record shadow boundaries on the original upright spread, before
+        # splitting. A missing dark gutter must never imply shadow removal.
+        shadows = [None, None]
+        if gutter_present and save_gutter_geometry and not dry_run:
+            shadows = [trace_gutter_shadow(preview,column,'left'),
+                       trace_gutter_shadow(preview,column,'right')]
         position = page.rect.width * column / preview.shape[1]
         margin = gutter_mm * 72 / 25.4
         # Use rectangle coordinates in the *displayed* page orientation.
@@ -276,7 +287,7 @@ def split_pdf(input_path: Path, output_path: Path, *, search_fraction: float = 0
               f"left={bounds[0].width:.1f}pt right={bounds[1].width:.1f}pt")
         if dry_run:
             continue
-        for clip in bounds:
+        for side_no, clip in enumerate(bounds):
             if clip.width <= 0:
                 raise ValueError(f"Gutter margin too large on spread {number}")
             # `show_pdf_page` does not preserve source page /Rotate metadata.
@@ -288,9 +299,24 @@ def split_pdf(input_path: Path, output_path: Path, *, search_fraction: float = 0
             native_clip = clip * page.derotation_matrix
             output.insert_pdf(source, from_page=number - 1, to_page=number - 1)
             output[-1].set_cropbox(native_clip)
+            # Normalized depth uses *split page width*, not full spread.
+            samples = shadows[side_no]
+            if samples:
+                source_width = column if side_no == 0 else preview.shape[1]-column
+                samples = [[yf,round(df * source_width / (column if side_no==0 else preview.shape[1]-column),6)]
+                           for yf,df in samples]
+            geometry_pages.append({'page':len(output)-1,
+                                   'edge':'right' if side_no==0 else 'left',
+                                   'samples':samples or []})
 
     if not dry_run:
         output.save(output_path, garbage=4, deflate=True)
+        if save_gutter_geometry:
+            path = output_path.with_suffix('.gutter.json')
+            path.write_text(json.dumps({'version':1,'source':output_path.name,
+                                        'page_count':len(output),
+                                        'pages':geometry_pages},indent=2))
+            print(f'Saved deferred gutter geometry to {path}')
         print(f"Saved {len(output)} single pages to {output_path}")
     output.close()
     source.close()
@@ -311,11 +337,14 @@ def main() -> None:
     parser.add_argument("--min-continuity", type=float, default=.45,
                         help="Minimum fraction of rows covered by a visible gutter (default: 0.45)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-gutter-geometry", action="store_true",
+                        help="Disable deferred gutter-geometry sidecar")
     args = parser.parse_args()
     split_pdf(args.input, args.output, search_fraction=args.search_fraction,
               gutter_mm=args.gutter_mm, target_width=args.preview_width,
               dry_run=args.dry_run, min_confidence=args.min_confidence,
-              min_continuity=args.min_continuity)
+              min_continuity=args.min_continuity,
+              save_gutter_geometry=not args.no_gutter_geometry)
 
 
 if __name__ == "__main__":

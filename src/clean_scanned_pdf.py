@@ -11,6 +11,8 @@ Pure image processing: no OCR, no cloud service. Output is an image-only PDF.
 """
 # Standard-library modules: CLI parsing, PDF/image geometry, diagnostics, and paths.
 import argparse
+import json
+from deferred_gutter import apply_deferred_gutter
 import math
 import sys
 from pathlib import Path
@@ -403,6 +405,341 @@ def central_text_scale(rgb):
     return float(np.mean(np.clip(sizes, a, b)))
 
 
+def trimmed_central_mean(values, fraction=0.30, minimum=5):
+    """Discard the lowest and highest ``fraction`` and mean the middle.
+
+    The default discards 30% at each end (central 40%). It is distinct from
+    winsorization, which clamps the tails instead of removing them.
+    """
+    a=np.sort(np.asarray(values,dtype=np.float64))
+    a=a[np.isfinite(a)]
+    if len(a)<minimum:
+        return None
+    low=int(math.floor(len(a)*fraction))
+    high=int(math.ceil(len(a)*(1.0-fraction)))
+    return float(np.mean(a[low:high])) if high>low else None
+
+
+def collect_glyph_heights(rgb):
+    """Collect plausible character-component heights in source pixel units.
+
+    The same central-page sampling ROI and geometric shape filters as the
+    historical glyph estimator are used. A separate document-wide pass decides
+    which height population represents normal body type.
+    """
+    gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+    h,w=gray.shape
+    frac=math.sqrt(.20)
+    x0,x1=round(w*(1-frac)/2),round(w*(1+frac)/2)
+    y0,y1=round(h*(1-frac)/2),round(h*(1+frac)/2)
+    roi=gray[y0:y1,x0:x1]
+    factor=min(1.0,800/max(roi.shape))
+    if factor<1:
+        roi=cv2.resize(roi,None,fx=factor,fy=factor,interpolation=cv2.INTER_AREA)
+    _,_,stats,_=cv2.connectedComponentsWithStats(foreground(roi),8)
+    heights=[]
+    for x,y,cw,ch,area in stats[1:]:
+        if (2 <= cw <= roi.shape[1]*.075 and
+            3 <= ch <= roi.shape[0]*.085 and
+            4 <= area <= roi.size*.003 and
+            .07 <= area/max(1,cw*ch) <= .9 and
+            .12 <= cw/ch <= 3.0):
+            heights.append(float(ch)/factor)
+    return np.asarray(heights,dtype=np.float64)
+
+
+def glyph_height_nearest_document_mean(values, document_mean, fraction=0.30,
+                                       minimum=25):
+    """Average the nearest 30% of page glyphs to the *document-wide* mean.
+
+    The document reference is estimated from pooled body-page components;
+    unusually small footnote fonts therefore compete on distance to the same
+    reference as the standard body font on every page.
+    """
+    arr=np.asarray(values,dtype=np.float64)
+    arr=arr[np.isfinite(arr)]
+    if len(arr)<minimum or document_mean is None or not np.isfinite(document_mean):
+        return None
+    k=max(1,int(round(fraction*len(arr))))
+    # Stable tie ordering yields repeatable results for integer-valued heights.
+    chosen=np.argsort(np.abs(arr-document_mean),kind='stable')[:k]
+    return float(arr[chosen].mean())
+
+
+def central_text_scale_trimmed(rgb):
+    """Legacy central-40%-by-rank estimator retained for comparisons."""
+    return trimmed_central_mean(collect_glyph_heights(rgb),minimum=25)
+
+
+def tight_edge_clusters(values, tolerance, min_members=5):
+    """Find nonoverlapping tight clusters among sorted line-edge coordinates.
+
+    Each cluster has at least ``min_members`` observations and a total width
+    no greater than ``tolerance`` pixels. Densest windows are chosen first,
+    preventing a few indented lines from joining the main column edge.
+    """
+    array = np.sort(np.asarray(values, dtype=np.float64))
+    array = array[np.isfinite(array)]
+    if len(array) < min_members:
+        return []
+    candidates = []
+    j = 0
+    for i in range(len(array)):
+        j = max(j, i)
+        while j < len(array) and array[j] - array[i] <= tolerance:
+            j += 1
+        if j - i >= min_members:
+            candidates.append((i, j, j-i, float(np.median(array[i:j]))))
+    candidates.sort(key=lambda c: (-c[2], c[3]))
+    selected = []
+    for candidate in candidates:
+        if any(candidate[0] < other[1] and other[0] < candidate[1]
+               for other in selected):
+            continue
+        selected.append(candidate)
+    return sorted(selected, key=lambda c: c[3])
+
+
+def clustered_column_width(lines, glyph_height=None, min_components=5,
+                           min_width=50, min_lines=10, edge_cluster_min=5,
+                           tolerance_ems=0.55):
+    """Measure column width using the outermost tight line-edge clusters.
+
+    Left and right edge distributions are clustered independently to avoid
+    indentation and short last lines. The outermost qualifying cluster on
+    each side determines the column boundaries. If either side fails, return
+    None so the caller can fall back to the trimmed glyph-height measurement.
+    """
+    valid = [(a, c) for a, b, c, d, n in lines
+             if n >= min_components and c-a >= min_width]
+    if len(valid) < min_lines:
+        return None
+    tolerance = max(8.0, tolerance_ems * float(glyph_height or 25.0))
+    left_clusters = tight_edge_clusters([a for a, c in valid], tolerance,
+                                        edge_cluster_min)
+    right_clusters = tight_edge_clusters([c for a, c in valid], tolerance,
+                                         edge_cluster_min)
+    if not left_clusters or not right_clusters:
+        return None
+    left = left_clusters[0][3]
+    right = right_clusters[-1][3]
+    return float(right-left) if right > left else None
+
+
+
+def clustered_left_edge(lines, glyph_height=None, min_components=5,
+                        min_width=50, edge_cluster_min=5,
+                        tolerance_ems=0.55):
+    """Return outermost reliable left text-column cluster even without a right cluster."""
+    lefts = [a for a, b, c, d, n in lines
+             if n >= min_components and c-a >= min_width]
+    tolerance = max(8.0, tolerance_ems * float(glyph_height or 25.0))
+    groups = tight_edge_clusters(lefts, tolerance, edge_cluster_min)
+    return float(groups[0][3]) if groups else None
+
+
+def _baseline_alignment_crop(row, frame, factor, dpi):
+    """Reproduce the preexisting geometry before choosing shared left alignment."""
+    mode = 'native'
+    if frame is not None and row.get('scale_eligible', False):
+        _, rect, _, fallback = document_crop(
+            row['image'], row['bbox'], row['lines'], frame, factor,
+            pad=round(dpi * .10))
+        mode = 'safety-expand' if fallback else 'shared'
+    else:
+        rect = row['bbox']
+    if mode == 'native' and len(row['lines']) < 18:
+        h, w = row['image'].shape[:2]
+        rect = (0, 0, w, h)
+    return expand_crop_rect(rect, row['image'].shape, fraction=0.05)
+
+
+def _horizontal_placement_geometry(rect, factor, dpi):
+    """Predict the final centering offset and effective scale for a crop."""
+    x0, y0, x1, y1 = rect
+    width, height = x1-x0, y1-y0
+    scaled_w = max(1, round(width*factor))
+    scaled_h = max(1, round(height*factor))
+    canvas_w, canvas_h = round(5.5*dpi), round(8.5*dpi)
+    fit = min(1., canvas_w/scaled_w, canvas_h/scaled_h)
+    placed_w = round(scaled_w*fit) if fit<1 else scaled_w
+    offset = (canvas_w-placed_w)//2
+    return offset, (scaled_w/width)*fit
+
+
+def align_crop_left_to_cluster(rect, row, factor, target_x, dpi,
+                               safety_px=None):
+    """Move the *crop origin* to align the reliable left text cluster.
+
+    Preserve the crop's original width where feasible. When moving the crop
+    would cut any detected credible text, extend its boundary and allow the
+    final half-letter fit to shrink it instead of clipping. If full alignment
+    is physically impossible without clipping, content safety takes priority.
+    """
+    cluster = row.get('left_cluster')
+    if cluster is None or target_x is None:
+        return rect, None
+    x0, y0, x1, y1 = rect
+    width = x1-x0
+    page_width = row['image'].shape[1]
+    offset, effective_scale = _horizontal_placement_geometry(rect, factor, dpi)
+    proposed_x0 = int(round(cluster-(target_x-offset)/effective_scale))
+    # Keep every credible line, including headings/footnotes not in main cluster.
+    # Also preserve the text-derived crop extent, not just clustered lines.
+    left_bounds = [row['bbox'][0]]
+    right_bounds = [row['bbox'][2]]
+    left_bounds += [a for a,b,c,d,n in row['lines'] if n>=2]
+    right_bounds += [c for a,b,c,d,n in row['lines'] if n>=2]
+    left_bounds += [a for a,b,c,d,n in row['contrast_lines'] if n>=2]
+    right_bounds += [c for a,b,c,d,n in row['contrast_lines'] if n>=2]
+    buffer = int(round(safety_px if safety_px is not None else max(8, dpi*.045)))
+    protected_left = max(0, min(left_bounds)-buffer)
+    protected_right = min(page_width, max(right_bounds)+buffer)
+    # If crop must expand, adjust both sides rather than shifting content off
+    # the page. Existing conservative x0/x1 are also retained as safety bounds
+    # when baseline crop is already based on very wide coherent text.
+    left = max(0, min(proposed_x0, protected_left))
+    right = min(page_width, max(left+width, protected_right))
+    if right-left < width:
+        left=max(0, right-width)
+    if right > page_width:
+        right=page_width
+    if left < 0:
+        left=0
+    if right<=left:
+        return rect, None
+    changed = (int(left),y0,int(right),y1)
+    new_offset, new_scale = _horizontal_placement_geometry(changed, factor, dpi)
+    actual = (cluster-left)*new_scale+new_offset
+    return changed, float(actual)
+
+
+
+def _vertical_placement_geometry(rect, factor, dpi):
+    """Return output vertical centering and effective source-to-output scale."""
+    x0,y0,x1,y1 = rect
+    width,height = x1-x0,y1-y0
+    scaled_w=max(1,round(width*factor))
+    scaled_h=max(1,round(height*factor))
+    canvas_w,canvas_h=round(5.5*dpi),round(8.5*dpi)
+    fit=min(1.,canvas_w/scaled_w,canvas_h/scaled_h)
+    placed_h=round(scaled_h*fit) if fit<1 else scaled_h
+    offset=(canvas_h-placed_h)//2
+    return offset,(scaled_h/height)*fit
+
+
+def top_text_rectangle(row):
+    """Upper edge of the highest credible detected text line.
+
+    Use the conservative accepted-line proposals rather than small isolated
+    component groups, which can be scanner noise near the top of the page.
+    """
+    credible=[b for a,b,c,d,n in row['lines'] if n>=2]
+    return float(min(credible)) if credible else None
+
+
+def align_crop_top_to_text(rect,row,factor,target_y,dpi,
+                           tolerance_fraction=0.05,safety_px=None):
+    """Align the highest text line by choosing the vertical crop origin.
+
+    Only adjust if the current line position is already within 5% of the
+    final page height from the shared reference. Preserve the total text
+    extent and leave the baseline crop unchanged if alignment is unsafe.
+    """
+    top=top_text_rectangle(row)
+    if top is None or target_y is None:
+        return rect,None,'no-top-line'
+    x0,y0,x1,y1=rect
+    page_h=row['image'].shape[0]
+    height=y1-y0
+    offset,scale=_vertical_placement_geometry(rect,factor,dpi)
+    current=(top-y0)*scale+offset
+    if abs(current-target_y)>tolerance_fraction*8.5*dpi:
+        return rect,float(current),'outside-5pct'
+    proposed_y0=int(round(top-(target_y-offset)/scale))
+    # Keep complete text extent and its safety margin. The original crop is
+    # allowed to shift but never discard any credible line or original bbox.
+    tops=[row['bbox'][1]]
+    bottoms=[row['bbox'][3]]
+    for a,b,c,d,n in row['lines'] + row['contrast_lines']:
+        if n>=2:
+            tops.append(b);bottoms.append(d)
+    guard=int(round(safety_px if safety_px is not None else max(8,dpi*.045)))
+    protected_top=max(0,int(min(tops))-guard)
+    protected_bottom=min(page_h,int(max(bottoms))+guard)
+    new_y0=max(0,min(proposed_y0,protected_top))
+    new_y1=min(page_h,max(new_y0+height,protected_bottom))
+    if new_y1<=new_y0:
+        return rect,float(current),'invalid'
+    proposed=(x0,int(new_y0),x1,int(new_y1))
+    new_offset,new_scale=_vertical_placement_geometry(proposed,factor,dpi)
+    actual=(top-new_y0)*new_scale+new_offset
+    # Avoid a crop expansion that makes the top alignment worse.
+    if abs(actual-target_y)>abs(current-target_y)+1:
+        return rect,float(current),'safety-limited'
+    return proposed,float(actual),'aligned'
+
+
+def central_column_width(lines, min_components=5, min_width=50):
+    """Legacy trimmed-bound estimator kept for experimental comparisons."""
+    valid=[(a,c) for a,b,c,d,n in lines
+           if n >= min_components and c-a >= min_width]
+    if len(valid)<10:
+        return None
+    left=trimmed_central_mean([a for a,c in valid])
+    right=trimmed_central_mean([c for a,c in valid])
+    if left is None or right is None or right <= left:
+        return None
+    return right-left
+
+
+def select_scale_factors(rows, tolerance=0.08):
+    """Width first, then document-anchored glyph height, then central scale average.
+
+    References come only from text-rich body pages. The final fallback is the
+    central-40% mean of *reliable page rescalings*, avoiding a single aberrant
+    page forcing an implausible scale correction. Sparse pages remain native.
+    """
+    rich=[r for r in rows if len(r['lines'])>=10]
+    # Pool all plausible heights from text-rich pages, giving each glyph an
+    # equal weight; sparse opening/title pages do not define body typography.
+    height_arrays=[r['glyph_heights'] for r in rich
+                   if len(r.get('glyph_heights',[]))>=25]
+    document_mean=float(np.mean(np.concatenate(height_arrays))) if height_arrays else None
+    for row in rows:
+        row['glyph_document30']=glyph_height_nearest_document_mean(
+            row.get('glyph_heights',[]),document_mean)
+    width_values=[r.get('column_width') for r in rich if r.get('column_width')]
+    height_values=[r.get('glyph_document30') for r in rich if r.get('glyph_document30')]
+    width_ref=trimmed_central_mean(width_values,minimum=5)
+    height_ref=trimmed_central_mean(height_values,minimum=5)
+    approved=[]
+    for row in rows:
+        row['scale_eligible']=(len(row['lines'])>=10)
+        row['scale_source']='native'
+        row['scale_factor']=1.0
+        if not row['scale_eligible']:
+            continue
+        width=row.get('column_width')
+        height=row.get('glyph_document30')
+        if width and width_ref and abs(width/width_ref-1.0)<=tolerance:
+            row['scale_source']='column-width'
+            row['scale_factor']=width_ref/width
+        elif height and height_ref and abs(height/height_ref-1.0)<=tolerance:
+            row['scale_source']='glyph-height'
+            row['scale_factor']=height_ref/height
+        else:
+            row['scale_source']='central-fallback'
+        if row['scale_source']!='central-fallback':
+            approved.append(row['scale_factor'])
+    fallback=trimmed_central_mean(approved,minimum=3)
+    if fallback is None: fallback=1.0
+    for row in rows:
+        if row['scale_source']=='central-fallback':
+            row['scale_factor']=fallback
+    return width_ref,height_ref,fallback
+
+
 def half_letter_canvas(img, target_ratio=5.5/8.5, scale=1.):
     """Apply document-level font scale before final page placement.
 
@@ -543,7 +880,7 @@ def winsor_mean(values, trim=.20):
     return float(np.mean(np.clip(vals, lo, hi)))
 
 
-def shared_crop_frame(rows, target, tolerance, dpi, margin_px):
+def shared_crop_frame(rows, target, tolerance, dpi, margin_px, use_selected_factors=False):
     """Infer a consensus crop size from reliably comparable pages.
 
     Parameters
@@ -573,15 +910,18 @@ def shared_crop_frame(rows, target, tolerance, dpi, margin_px):
     Their winsorized means make the frame less sensitive to a few erroneous
     bounding boxes. The frame is independently positioned for each page.
     """
-    usable = [r for r in rows if r['glyph'] is not None and r['lines']
-              and len(r['lines']) >= 10 and abs(r['glyph']/target-1) <= tolerance]
+    if use_selected_factors:
+        usable = [r for r in rows if r.get('scale_eligible') and r['lines']]
+    else:
+        usable = [r for r in rows if r['glyph'] is not None and r['lines']
+                  and len(r['lines']) >= 10 and abs(r['glyph']/target-1) <= tolerance]
     if len(usable) < 3:
         return None
     widths = []
     heights = []
     for r in usable:
         x0,y0,x1,y1 = r['bbox']
-        factor = target/r['glyph']
+        factor = r['scale_factor'] if use_selected_factors else target/r['glyph']
         widths.append((x1-x0)*factor)
         heights.append((y1-y0)*factor)
     # Never force overall document sizing to shrink the matched glyphs.
@@ -785,6 +1125,8 @@ def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="strok
     # Measure only the center of the *original deskewed page* so that a bad
     # crop proposal cannot itself influence the font-scale measurement.
     measure = central_text_scale(corrected)
+    glyph_heights = collect_glyph_heights(corrected)
+    glyph_trimmed = trimmed_central_mean(glyph_heights, minimum=25)
     if crop and lines:
         # Chapter numerals (e.g. a large "1") are part of a heading;
         # small isolated folio numbers are intentionally NOT recovered.
@@ -800,7 +1142,11 @@ def process_page(rgb, dpi, max_skew, margin_mm, tile, crop, text_detector="strok
         # are deliberately excluded from the stronger contrast region.
         contrast_lines=[(int(a/shrink),int(b/shrink),int(c/shrink),int(d/shrink),n)
                         for a,b,c,d,n in grouped if n>=2]
+    # Use aligned outer-edge clusters so indentations do not shrink the width.
+    # No qualifying cluster on either side means glyph-height fallback.
+    column_width = clustered_column_width(contrast_lines, glyph_trimmed) if crop else None
     return dict(image=corrected,angle=angle,confidence=confidence,glyph=measure,
+                glyph_heights=glyph_heights, glyph_trimmed=glyph_trimmed,column_width=column_width,
                 bbox=bbox,lines=lines,contrast_lines=contrast_lines,margin=margin_px)
 
 
@@ -835,9 +1181,11 @@ def main():
     ap.add_argument('--tile-ems', type=float, default=4.0,
                     help='local white calibration cell side in document glyph heights (default: 4; clamped to 2%% of shortest and 20%% of longest image dimension)')
     ap.add_argument('--pages', default=None, help='page range, e.g. 1-3 or 2,4,6')
+    ap.add_argument('--gutter-geometry', type=Path, default=None,
+                    help='splitter JSON sidecar (autodetected beside input by default)')
     ap.add_argument('--no-crop', action='store_true', help='keep whole page after straightening')
     ap.add_argument('--font-tolerance', type=float, default=.08,
-                    help='normalize pages whose estimated glyph size differs at most this fraction from median')
+                    help='normalize text-rich pages whose estimated glyph size differs at most this fraction from the document reference (default: 0.15)')
     ap.add_argument('--no-font-match', action='store_true', help='disable font-size matching')
     ap.add_argument('--no-shared-crop', action='store_true',help='disable document-wide common crop frame')
     ap.add_argument('--remove-vertical-artifacts', action='store_true',
@@ -881,6 +1229,16 @@ def main():
     if args.input.resolve() == args.output.resolve():
         ap.error('Input and output must differ')
     source = fitz.open(args.input)
+    gutter_sidecar=args.gutter_geometry or args.input.with_suffix('.gutter.json')
+    gutter_records={}
+    if gutter_sidecar.exists():
+        payload=json.loads(gutter_sidecar.read_text())
+        if payload.get('version')!=1 or payload.get('page_count')!=len(source) or payload.get('source')!=args.input.name:
+            raise ValueError(f'Gutter geometry does not match input PDF: {gutter_sidecar}')
+        gutter_records={int(p['page']):p for p in payload['pages']}
+        print(f'Loaded deferred gutter geometry: {gutter_sidecar}',file=sys.stderr)
+    elif args.gutter_geometry is not None:
+        raise FileNotFoundError(args.gutter_geometry)
     output = fitz.open()
     if args.pages:
         indices = []
@@ -907,28 +1265,66 @@ def main():
         row=process_page(img,args.dpi,args.max_skew,args.margin_mm,None,not args.no_crop,
                          text_detector=args.text_detector, text_filter=args.text_filter)
         row['index']=i
+        row['source_shape']=img.shape[:2]
         processed.append(row)
-    valid = [r['glyph'] for r in processed if r['glyph'] is not None]
-    # Use the trimmed mean, not a single potentially unrepresentative page.
-    target = winsor_mean(valid) if valid else None
-    print(f'Central glyph reference: {target:.2f} pixels' if target else
-          'Central glyph reference unavailable; no font matching', file=sys.stderr)
+    width_ref, height_ref, fallback_factor=select_scale_factors(processed,tolerance=0.08)
+    for row in processed:
+        row['left_cluster'] = clustered_left_edge(
+            row['contrast_lines'], row.get('glyph_document30'))
+
+    # The reference glyph height also sets feathering and local calibration.
+    # Use the document-anchored nearest-30% measurement for physical scale.
+    target = height_ref
+    print(f'Body glyph ref: {height_ref:.2f}px; column ref: {width_ref:.2f}px; '
+          f'fallback: x{fallback_factor:.3f}' if height_ref and width_ref else
+          'Scale reference unavailable; keeping native scale',file=sys.stderr)
     frame=None
     if target and not args.no_crop and not args.no_font_match and not args.no_shared_crop:
         frame=shared_crop_frame(processed,target,args.font_tolerance,args.dpi,
-                                round(args.margin_mm / 25.4 * args.dpi))
+                                round(args.margin_mm / 25.4 * args.dpi),
+                                use_selected_factors=True)
         if frame:
-            print(f'Shared crop frame at reference glyph scale: {frame[0]} x {frame[1]} pixels',file=sys.stderr)
+            print(f'Shared crop frame: {frame[0]} x {frame[1]} pixels',file=sys.stderr)
+    # Compute a shared *output-pixel* left text position under the original
+    # safe crop/scale geometry. Use the median of text-rich pages, independent
+    # of the right-edge cluster and excluding sparse title/blank pages.
+    left_reference_positions=[]
+    for row in processed:
+        if not row.get('scale_eligible') or row.get('left_cluster') is None:
+            continue
+        factor=row.get('scale_factor',1.0) if not args.no_font_match else 1.0
+        baseline_rect=_baseline_alignment_crop(row, frame, factor, args.dpi)
+        offset, eff=_horizontal_placement_geometry(baseline_rect,factor,args.dpi)
+        left_reference_positions.append((row['left_cluster']-baseline_rect[0])*eff+offset)
+    target_left_x = float(np.median(left_reference_positions)) if left_reference_positions else None
+    print(f'Left-column target on final canvas: {target_left_x:.1f} px'
+          if target_left_x is not None else 'Left-column target unavailable',
+          file=sys.stderr)
+    # Document-wide top-line target, measured under baseline safe crop geometry.
+    # Top lines are from the conservative line detector, not artifact-prone
+    # singleton connected components. Only text-rich pages qualify.
+    top_reference_positions=[]
+    for row in processed:
+        if not row.get('scale_eligible') or top_text_rectangle(row) is None:
+            continue
+        factor=row.get('scale_factor',1.0) if not args.no_font_match else 1.0
+        baseline_rect=_baseline_alignment_crop(row,frame,factor,args.dpi)
+        offset,eff=_vertical_placement_geometry(baseline_rect,factor,args.dpi)
+        top_reference_positions.append(
+            (top_text_rectangle(row)-baseline_rect[1])*eff+offset)
+    target_top_y=(float(np.median(top_reference_positions))
+                  if top_reference_positions else None)
+    print(f'Top-text target on final canvas: {target_top_y:.1f} px'
+          if target_top_y is not None else 'Top-text target unavailable',
+          file=sys.stderr)
     # PASS 2: select either a consensus crop or a conservative per-page crop,
     # then perform enhancement and render onto a fixed-size white canvas.
     for row in processed:
         i=row['index']
         angle=row['angle'];confidence=row['confidence'];measure=row['glyph']
         ratio = measure/target if (measure is not None and target is not None) else None
-        match = (not args.no_font_match and ratio is not None and
-                 len(row['lines']) >= 10 and
-                 abs(ratio-1) <= args.font_tolerance)
-        factor = target/measure if match else 1.0
+        match = (not args.no_font_match and row.get('scale_eligible',False))
+        factor = row.get('scale_factor',1.0) if match else 1.0
         mode='native'; coverage=1.
         if frame is not None and match:
             result,rect,coverage,fallback=document_crop(
@@ -950,8 +1346,28 @@ def main():
         # crop—including per-page fallbacks—receives the same extra whitespace.
         # Expand every final crop by 5% in both dimensions (2.5% per side).
         rect = expand_crop_rect(rect, row['image'].shape, fraction=0.05)
+        aligned_output_x = None
+        if match and row.get('left_cluster') is not None and target_left_x is not None:
+            rect, aligned_output_x = align_crop_left_to_cluster(
+                rect,row,factor,target_left_x,args.dpi)
+        aligned_output_y=None
+        vertical_reason='ineligible'
+        if match and target_top_y is not None:
+            rect,aligned_output_y,vertical_reason=align_crop_top_to_text(
+                rect,row,factor,target_top_y,args.dpi,tolerance_fraction=0.05)
         x0,y0,x1,y1 = rect
         result = row['image'][y0:y1,x0:x1]
+        # Deferred gutter shadow removal: the splitter detected/traced this
+        # band on the upright full spread but changed no pixels. Now text-line
+        # rectangles exist; carry geometry through the measured deskew and
+        # crop, subtract protected text, then whiten only surviving shadow.
+        if row['index'] in gutter_records:
+            record=gutter_records[row['index']]
+            protected_lines=row['contrast_lines'] + row['lines']
+            result=apply_deferred_gutter(result,record,row['angle'],
+                                         row['source_shape'],rect,
+                                         text_lines=protected_lines,
+                                         safety_pixels=max(5,round((measure or target or 20)*.45)))
         # In particular, do not clip the corrected background at the detected
         # top/bottom text limits: doing so caused the abrupt artificial white
         # boundary seen in the previous version of page 4.
@@ -1038,9 +1454,14 @@ def main():
         encoded = encode_grayscale_jpeg(gray_final, quality=args.jpeg_quality)
         new=output.new_page(width=5.5*72,height=8.5*72)
         new.insert_image(new.rect,stream=encoded)
+        print(f'  vertical page {i+1:2}: {vertical_reason}, '
+              f'top y={aligned_output_y:.1f}' if aligned_output_y is not None else
+              f'  vertical page {i+1:2}: {vertical_reason}',file=sys.stderr)
         print(f'page {i+1:3}: rotation {angle:+.2f}, confidence {confidence:.2f}, '
               f'glyph {measure if measure else 0:.1f}px, match x{factor:.3f}, '
-              f'crop {mode} (text {coverage:.1%}), fit x{fit:.3f}',file=sys.stderr)
+              f'scale {row.get("scale_source","native")}, crop {mode} (text {coverage:.1%}), fit x{fit:.3f}, '
+              f'left x{aligned_output_x:.1f}' if aligned_output_x is not None else
+              f'page {i+1:3}: scale {row.get("scale_source","native")}, crop {mode}, fit x{fit:.3f} (unaligned)',file=sys.stderr)
     output.save(args.output,garbage=4,deflate=True)
     output.close()
     source.close()
